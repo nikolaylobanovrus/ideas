@@ -2,7 +2,8 @@
 """Собирает Excel-версию анализа из data/ideas.json и README.md.
 
 Запуск:
-    python3 scripts/build_xlsx.py            # пишет ideas-russia-2026.xlsx в корень репозитория
+    python3 scripts/build_xlsx.py                          # пишет ideas-russia-2026.xlsx в корень репозитория
+    python3 scripts/build_xlsx.py --recalc=<recalc.py>     # то же + пересчёт в LibreOffice, чтобы в файле были значения
 
 Балл и место в файле считаются формулами Excel от оценок и весов, поэтому таблицу можно
 править прямо в Excel. Тексты карточек, кластеры, занятые ниши, правила рынка и источники
@@ -11,6 +12,10 @@
 import json
 import math
 import re
+import shutil
+import tempfile
+import zipfile
+from fractions import Fraction
 from pathlib import Path
 
 from openpyxl import Workbook
@@ -94,6 +99,8 @@ def parse_cards(readme):
         head, _, body = block.partition("\n")
         cid = head.split('"')[0].upper()
         fields, current = {}, None
+        subtitle = body.split("\n")[1].strip().strip("*").split(" · Балл")[0]
+        fields["Аналоги (подробно)"] = re.sub(r"^Аналоги?: ", "", subtitle)
         for line in body.split("\n")[1:]:
             if line.startswith(("### ", "## ", "---", "<a id=")):
                 break
@@ -155,16 +162,23 @@ def set_widths(ws, widths):
 
 
 def fit_row_height(ws, row, widths, min_lines=1):
-    """Оценивает высоту строки по длине текста в переносимых ячейках (Excel не подгоняет её сам)."""
-    lines = min_lines
+    """Оценивает высоту строки по длине текста в переносимых ячейках (Excel не подгоняет её сам).
+
+    Оценка с запасом: в строку помещается ~0,9 ширины столбца обычным шрифтом и ~0,8 — жирным,
+    для мелкого шрифта пропорционально больше.
+    """
+    height = min_lines * 12.75
     for col, width in widths.items():
-        value = ws[f"{col}{row}"].value
+        cell = ws[f"{col}{row}"]
+        value = cell.value
         if not isinstance(value, str) or value.startswith("="):
             continue
-        per_line = max(1.0, width * 1.05)
+        size = cell.font.sz or 10
+        per_line = max(1.0, width * (0.8 if cell.font.b else 0.9) * (10 / size))
+        line_h = 11.25 if size <= 8 else 12.75
         n = sum(max(1, math.ceil(len(part) / per_line)) for part in value.split("\n"))
-        lines = max(lines, n)
-    ws.row_dimensions[row].height = min(409, lines * 12.75 + 4)
+        height = max(height, n * line_h)
+    ws.row_dimensions[row].height = min(409, height + 4)
 
 
 def header_row(ws, row, headers):
@@ -179,6 +193,16 @@ def body_cell(ws, row, col, value, font=F_BODY, align=WRAP_TOP):
     return c
 
 
+def weight_ints(meta):
+    """Переводит веса из data/ideas.json в целые числа 0–10 для ячеек листа «Веса и шкалы»."""
+    ints = {k: round(v * 20) for k, v in meta["weights"].items()}
+    total_w, total_i = sum(meta["weights"].values()), sum(ints.values())
+    for k, v in meta["weights"].items():
+        if not 0 <= ints[k] <= 10 or abs(ints[k] / total_i - v / total_w) > 1e-9:
+            raise SystemExit(f"Вес {k}={v} не переводится в целое число 0–10 без искажения пропорций")
+    return ints
+
+
 def build_weights(wb, meta, readme):
     ws = wb.create_sheet("Веса и шкалы")
     ws["A1"] = "Веса итогового балла и шкалы оценок"
@@ -191,7 +215,7 @@ def build_weights(wb, meta, readme):
     ws.row_dimensions[2].height = 28
 
     header_row(ws, 5, ["Критерий", "Что оценивает", "Вес (ввод)", "Доля в балле"])
-    defaults = {"profit": 5, "popularity": 4, "competition": 4, "ease": 3, "cheapness": 2, "reg_safety": 2}
+    defaults = weight_ints(meta)
     for n, (key, name, desc) in enumerate(WEIGHT_ROWS):
         r = 6 + n
         body_cell(ws, r, 1, name, F_BOLD)
@@ -220,6 +244,11 @@ def build_weights(wb, meta, readme):
         body_cell(ws, 23 + n, 1, label)
         c = body_cell(ws, 23 + n, 2, value, F_INPUT, CENTER_TOP)
         c.fill = FILL_INPUT
+    share = DataValidation(type="decimal", operator="between", formula1="0", formula2="1",
+                           showErrorMessage=True, error="Введите долю от 0 до 1 (например, 0,75)")
+    ws.add_data_validation(share)
+    share.add("B16:B19")
+    share.add("B23:B25")
 
     ws["A28"] = "Формула балла"
     ws["A28"].font = F_BOLD
@@ -256,6 +285,7 @@ def build_weights(wb, meta, readme):
         ws.row_dimensions[r].height = max(28, math.ceil(len(text) / 120) * 12.75 + 4)
 
     set_widths(ws, {"A": 30, "B": 52, "C": 14, "D": 30})
+    ws.page_setup.paperSize = ws.PAPERSIZE_A4
 
 
 def build_summary(wb, ideas):
@@ -263,12 +293,10 @@ def build_summary(wb, ideas):
     ws.title = "Сводная"
     ws["A1"] = "Онлайн-сервисы для России: 34 идеи, которые можно сделать с Claude Code (срез на 20.10.2026)"
     ws["A1"].font = F_TITLE
-    ws["A2"] = ("Синие ячейки — экспертные оценки, их можно менять (есть выпадающие списки). Балл, место и стоимость в рублях "
-                "считаются формулами; веса — на листе «Веса и шкалы». Подробное описание каждой идеи — на листе «Карточки».")
+    ws["A2"] = ("Синие ячейки и цветные столбцы «Тип», «Конкуренция в РФ», «Регуляторный риск» — экспертные оценки, их можно менять "
+                "(в цветных столбцах — выпадающие списки). Балл, место и стоимость в рублях считаются формулами; веса — на листе "
+                "«Веса и шкалы». Подробное описание каждой идеи — на листе «Карточки».")
     ws["A2"].font = F_NOTE
-    ws["A2"].alignment = WRAP_TOP
-    ws.merge_cells("A2:Q2")
-    ws.row_dimensions[2].height = 28
 
     headers = ["Место", "ID", "Продукт", "Тип", "Балл (0–100)", "Категория", "Аналог в мире",
                "Сложность (1–5)", "Стоимость MVP, уровень (1–4)", "Стоимость MVP", "Срок MVP",
@@ -312,8 +340,8 @@ def build_summary(wb, ideas):
         body_cell(ws, r, 16, i["monetization"])
         body_cell(ws, r, 17, i["channel"])
 
-    widths = {"A": 8, "B": 6, "C": 44, "D": 13, "E": 10, "F": 14, "G": 28, "H": 11, "I": 13, "J": 13,
-              "K": 11, "L": 12, "M": 12, "N": 13, "O": 12, "P": 34, "Q": 30}
+    widths = {"A": 8, "B": 6, "C": 44, "D": 13, "E": 10, "F": 14, "G": 28, "H": 11, "I": 14, "J": 13,
+              "K": 11, "L": 15, "M": 15, "N": 13, "O": 14, "P": 34, "Q": 30}
     set_widths(ws, widths)
     for r in range(first, last + 1):
         fit_row_height(ws, r, {k: widths[k] for k in "CGPQ"})
@@ -361,6 +389,7 @@ def build_summary(wb, ideas):
 
     ws.freeze_panes = "D5"
     ws.auto_filter.ref = f"A4:Q{last}"
+    ws.page_setup.paperSize = ws.PAPERSIZE_A4
     ws.page_setup.orientation = "landscape"
     ws.page_setup.fitToWidth = 1
     ws.page_setup.fitToHeight = 0
@@ -371,7 +400,7 @@ def build_summary(wb, ideas):
 
 def build_cards(wb, ideas, cards, first, last):
     ws = wb.create_sheet("Карточки")
-    headers = ["ID", "Продукт", "Тип", "Место", "Балл", "Аналог в мире"] + CARD_FIELDS + ["Ссылки"]
+    headers = ["ID", "Продукт", "Тип", "Место", "Балл", "Аналог в мире", "Аналоги (подробно)"] + CARD_FIELDS + ["Ссылки"]
     header_row(ws, 1, headers)
     ws.row_dimensions[1].height = 30
     s = "'Сводная'!"
@@ -385,20 +414,22 @@ def build_cards(wb, ideas, cards, first, last):
             body_cell(ws, r, col, f"=INDEX({s}${src}${first}:${src}${last},MATCH(A{r},{s}$B${first}:$B${last},0))",
                       F_LINK_SHEET, CENTER_TOP)
         body_cell(ws, r, 6, i["analog"])
+        body_cell(ws, r, 7, strip_md(fields["Аналоги (подробно)"])[0])
         urls = []
         for k, field in enumerate(CARD_FIELDS):
             text, found = strip_md(fields.get(field, ""))
             urls += found
-            body_cell(ws, r, 7 + k, text or "—")
-        body_cell(ws, r, 7 + len(CARD_FIELDS), "\n".join(dict.fromkeys(urls)) or "—", Font(name=FONT, size=8, color="555555"))
+            body_cell(ws, r, 8 + k, text or "—")
+        body_cell(ws, r, 8 + len(CARD_FIELDS), "\n".join(dict.fromkeys(urls)) or "—", Font(name=FONT, size=8, color="555555"))
 
-    widths = {"A": 6, "B": 28, "C": 12, "D": 8, "E": 7, "F": 22, "G": 46, "H": 34, "I": 46, "J": 40,
-              "K": 40, "L": 38, "M": 38, "N": 40}
+    widths = {"A": 6, "B": 28, "C": 12, "D": 8, "E": 7, "F": 22, "G": 28, "H": 46, "I": 34, "J": 46, "K": 40,
+              "L": 40, "M": 38, "N": 38, "O": 40}
     set_widths(ws, widths)
     for r in range(2, 2 + len(ideas)):
-        fit_row_height(ws, r, {k: widths[k] for k in "BFGHIJKLM"})
+        fit_row_height(ws, r, {k: widths[k] for k in "BFGHIJKLMNO"})
     ws.freeze_panes = "C2"
-    ws.auto_filter.ref = f"A1:N{1 + len(ideas)}"
+    ws.auto_filter.ref = f"A1:O{1 + len(ideas)}"
+    ws.page_setup.paperSize = ws.PAPERSIZE_A4
 
 
 def build_text_sheet(wb, title, headers, rows, widths, url_col=None):
@@ -415,23 +446,46 @@ def build_text_sheet(wb, title, headers, rows, widths, url_col=None):
         fit_row_height(ws, r, widths)
     set_widths(ws, widths)
     ws.freeze_panes = "B2"
+    ws.page_setup.paperSize = ws.PAPERSIZE_A4
     return ws
 
 
+def recalc_and_fix(recalc_script):
+    """Пересчитывает формулы в LibreOffice и возвращает автора комментариев, которого LibreOffice заменяет."""
+    import subprocess
+    import sys
+    out = subprocess.run([sys.executable, recalc_script, str(OUT), "120"], capture_output=True, text=True)
+    report = json.loads(out.stdout)
+    if report.get("status") != "success" or report.get("total_errors"):
+        raise SystemExit(f"Пересчёт не удался: {report}")
+    with tempfile.TemporaryDirectory() as tmp:
+        fixed = Path(tmp) / OUT.name
+        with zipfile.ZipFile(OUT) as src, zipfile.ZipFile(fixed, "w", zipfile.ZIP_DEFLATED) as dst:
+            for item in src.infolist():
+                payload = src.read(item.filename)
+                if item.filename.startswith("xl/comments"):
+                    payload = payload.replace(b"Unknown Author", "Анализ".encode("utf-8"))
+                dst.writestr(item, payload)
+        shutil.move(fixed, OUT)
+    print(f"Пересчитано формул: {report['total_formulas']}, ошибок: 0")
+
+
 def main():
+    import sys
     data = json.loads(DATA.read_text(encoding="utf-8"))
     readme = README.read_text(encoding="utf-8")
     ideas = data["ideas"]
 
     # Порядок строк — по баллу при весах по умолчанию (тот же, что в README). Место пересчитывается формулой.
-    w = data["meta"]["weights"]
-    comp, risk = dict(COMPETITION), dict(RISK)
+    w = weight_ints(data["meta"])
+    comp = {k: Fraction(str(v)) for k, v in COMPETITION}
+    risk = {k: Fraction(str(v)) for k, v in RISK}
 
     def default_score(i):
-        parts = (w["profit"] * i["profit"] / 5 + w["popularity"] * i["popularity"] / 5
-                 + w["competition"] * comp[i["competition"]] + w["ease"] * (6 - i["complexity"]) / 5
-                 + w["cheapness"] * (4 - i["cost_tier"]) / 3 + w["reg_safety"] * risk[i["reg_risk"]])
-        return round(100 * parts / sum(w.values()))
+        parts = (w["profit"] * Fraction(i["profit"], 5) + w["popularity"] * Fraction(i["popularity"], 5)
+                 + w["competition"] * comp[i["competition"]] + w["ease"] * Fraction(6 - i["complexity"], 5)
+                 + w["cheapness"] * Fraction(4 - i["cost_tier"], 3) + w["reg_safety"] * risk[i["reg_risk"]])
+        return math.floor(100 * parts / sum(w.values()) + Fraction(1, 2))  # как ROUND в Excel
 
     ideas.sort(key=lambda i: (-default_score(i), i["id"]))
 
@@ -452,7 +506,7 @@ def main():
         recommended = "⭐" in cells[0]
         clusters.append([cells[0].replace("⭐", "").replace("лучший", "").strip(), *cells[1:],
                          "Рекомендуем начать с него" if recommended else ""])
-    build_text_sheet(wb, "Кластеры", ["Кластер", "Продукты (в порядке запуска)", "Кто платит", "Почему вместе", "Рекомендация"],
+    build_text_sheet(wb, "Кластеры", ["Кластер", "Продукты (→ — порядок запуска)", "Кто платит", "Почему вместе", "Рекомендация"],
                      clusters, {"A": 24, "B": 50, "C": 22, "D": 60, "E": 22})
 
     _, niche_rows = md_table(section(readme, "Куда лучше не идти: ниши уже заняты"), "Ниша")
@@ -474,7 +528,8 @@ def main():
             comment = strip_md(rest[1:])[0]
         else:
             head, _, tail = rest.partition(". ")
-            name, comment = name + strip_md(head)[0].rstrip("."), strip_md(tail)[0]
+            sep = " " if head[:1].isspace() else ""
+            name, comment = name + sep + strip_md(head)[0].rstrip("."), strip_md(tail)[0]
         second.append([name.strip(), comment.strip() or "—"])
     build_text_sheet(wb, "Второй эшелон", ["Идея", "Комментарий"], second, {"A": 46, "B": 90})
 
@@ -491,6 +546,9 @@ def main():
     wb.properties.title = "Онлайн-сервисы для России — 34 идеи (октябрь 2026)"
     wb.save(OUT)
     print(f"Сохранено: {OUT.relative_to(ROOT)}")
+    recalc = [a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--recalc=")]
+    if recalc:
+        recalc_and_fix(recalc[0])
 
 
 if __name__ == "__main__":

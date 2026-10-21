@@ -8,27 +8,31 @@
 Чтобы пересчитать рейтинг под свои приоритеты, поменяйте meta.weights в data/ideas.json.
 """
 import json
+import math
 import sys
+from fractions import Fraction
 from pathlib import Path
 
 DATA = Path(__file__).resolve().parent.parent / "data" / "ideas.json"
 
-COMPETITION_OPENNESS = {"Нет": 1.0, "Низкая": 0.75, "Средняя": 0.5, "Высокая": 0.25}
-REG_SAFETY = {"Низкий": 1.0, "Средний": 0.6, "Высокий": 0.2}
+COMPETITION_OPENNESS = {"Нет": Fraction(1), "Низкая": Fraction(3, 4), "Средняя": Fraction(1, 2), "Высокая": Fraction(1, 4)}
+REG_SAFETY = {"Низкий": Fraction(1), "Средний": Fraction(3, 5), "Высокий": Fraction(1, 5)}
 COST_LABEL = {1: "до 0,3 млн ₽", 2: "0,3–1 млн ₽", 3: "1–3 млн ₽", 4: "3+ млн ₽"}
 TYPE_LABEL = {"world": "🌍 Есть в мире", "new": "💡 Новое"}
 
 
 def score(idea, weights):
     parts = {
-        "profit": idea["profit"] / 5,
-        "popularity": idea["popularity"] / 5,
+        "profit": Fraction(idea["profit"], 5),
+        "popularity": Fraction(idea["popularity"], 5),
         "competition": COMPETITION_OPENNESS[idea["competition"]],
-        "ease": (6 - idea["complexity"]) / 5,
-        "cheapness": (4 - idea["cost_tier"]) / 3,
+        "ease": Fraction(6 - idea["complexity"], 5),
+        "cheapness": Fraction(4 - idea["cost_tier"], 3),
         "reg_safety": REG_SAFETY[idea["reg_risk"]],
     }
-    return round(100 * sum(weights[k] * v for k, v in parts.items()) / sum(weights.values()))
+    w = {k: Fraction(str(v)) for k, v in weights.items()}
+    raw = 100 * sum(w[k] * v for k, v in parts.items()) / sum(w.values())
+    return math.floor(raw + Fraction(1, 2))  # точное округление «половина вверх», как ROUND в Excel
 
 
 def dots(n, full="●", empty="○"):
