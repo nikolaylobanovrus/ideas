@@ -23,6 +23,7 @@ from openpyxl.comments import Comment
 from openpyxl.formatting.rule import CellIsRule, ColorScaleRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.workbook.properties import CalcProperties
+from openpyxl.worksheet.properties import PageSetupProperties
 from openpyxl.worksheet.datavalidation import DataValidation
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -156,6 +157,15 @@ def score_formula(r):
     return f"=IF({total}=0,0,ROUND(100*({body})/{total},0))"
 
 
+def landscape_fit(ws):
+    """Печать: A4, альбомная ориентация, по ширине страницы."""
+    ws.page_setup.paperSize = ws.PAPERSIZE_A4
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+
+
 def set_widths(ws, widths):
     for col, width in widths.items():
         ws.column_dimensions[col].width = width
@@ -285,7 +295,7 @@ def build_weights(wb, meta, readme):
         ws.row_dimensions[r].height = max(28, math.ceil(len(text) / 120) * 12.75 + 4)
 
     set_widths(ws, {"A": 30, "B": 52, "C": 14, "D": 30})
-    ws.page_setup.paperSize = ws.PAPERSIZE_A4
+    landscape_fit(ws)
 
 
 def build_summary(wb, ideas):
@@ -298,7 +308,7 @@ def build_summary(wb, ideas):
                 "«Веса и шкалы». Подробное описание каждой идеи — на листе «Карточки».")
     ws["A2"].font = F_NOTE
 
-    headers = ["Место", "ID", "Продукт", "Тип", "Балл (0–100)", "Категория", "Аналог в мире",
+    headers = ["Место", "ID", "Продукт", "Тип", "Балл\n(0–100)", "Категория", "Аналог в мире",
                "Сложность (1–5)", "Стоимость MVP, уровень (1–4)", "Стоимость MVP", "Срок MVP",
                "Прибыльность (1–5)", "Популярность (1–5)", "Конкуренция в РФ", "Регуляторный риск",
                "Монетизация", "Канал запуска"]
@@ -341,7 +351,7 @@ def build_summary(wb, ideas):
         body_cell(ws, r, 17, i["channel"])
 
     widths = {"A": 8, "B": 6, "C": 44, "D": 13, "E": 10, "F": 14, "G": 28, "H": 11, "I": 14, "J": 13,
-              "K": 11, "L": 15, "M": 15, "N": 13, "O": 14, "P": 34, "Q": 30}
+              "K": 11, "L": 15, "M": 15, "N": 14, "O": 15, "P": 34, "Q": 30}
     set_widths(ws, widths)
     for r in range(first, last + 1):
         fit_row_height(ws, r, {k: widths[k] for k in "CGPQ"})
@@ -429,7 +439,11 @@ def build_cards(wb, ideas, cards, first, last):
         fit_row_height(ws, r, {k: widths[k] for k in "BFGHIJKLMNO"})
     ws.freeze_panes = "C2"
     ws.auto_filter.ref = f"A1:O{1 + len(ideas)}"
+    # Карточки слишком широкие для печати «по ширине», поэтому на каждой странице повторяем шапку и ID/Продукт.
     ws.page_setup.paperSize = ws.PAPERSIZE_A4
+    ws.page_setup.orientation = "landscape"
+    ws.print_title_rows = "1:1"
+    ws.print_title_cols = "A:B"
 
 
 def build_text_sheet(wb, title, headers, rows, widths, url_col=None):
@@ -439,15 +453,35 @@ def build_text_sheet(wb, title, headers, rows, widths, url_col=None):
     for n, row in enumerate(rows):
         r = 2 + n
         for k, value in enumerate(row):
-            c = body_cell(ws, r, 1 + k, value, F_BOLD if k == 0 else F_BODY)
-            if url_col is not None and k == url_col and value.startswith("http"):
-                c.hyperlink = value
-                c.font = F_URL
+            body_cell(ws, r, 1 + k, value, F_BOLD if k == 0 else F_BODY)
         fit_row_height(ws, r, widths)
+        if url_col is not None and row[url_col].startswith("http"):
+            # Формула HYPERLINK, а не гиперссылка ячейки: такой текст переносится и в LibreOffice.
+            url = row[url_col]
+            if len(url) > 255 or '"' in url:
+                raise SystemExit(f"Ссылку нельзя записать в HYPERLINK: {url}")
+            c = ws.cell(row=r, column=1 + url_col, value=f'=HYPERLINK("{url}","{url}")')
+            c.font = F_URL
     set_widths(ws, widths)
     ws.freeze_panes = "B2"
-    ws.page_setup.paperSize = ws.PAPERSIZE_A4
+    landscape_fit(ws)
+    ws.print_title_rows = "1:1"
     return ws
+
+
+def dedupe_print_titles(xml):
+    """LibreOffice пишет область печати с повтором строк и столбцов дважды — оставляем одно определение на лист."""
+    seen = set()
+
+    def keep_first(m):
+        sheet = re.search(r'localSheetId="(\d+)"', m.group(0))
+        key = sheet.group(1) if sheet else None
+        if key in seen:
+            return ""
+        seen.add(key)
+        return m.group(0)
+
+    return re.sub(r'<definedName[^>]*name="_xlnm\.Print_Titles"[^>]*>.*?</definedName>', keep_first, xml)
 
 
 def recalc_and_fix(recalc_script):
@@ -465,6 +499,8 @@ def recalc_and_fix(recalc_script):
                 payload = src.read(item.filename)
                 if item.filename.startswith("xl/comments"):
                     payload = payload.replace(b"Unknown Author", "Анализ".encode("utf-8"))
+                elif item.filename == "xl/workbook.xml":
+                    payload = dedupe_print_titles(payload.decode("utf-8")).encode("utf-8")
                 dst.writestr(item, payload)
         shutil.move(fixed, OUT)
     print(f"Пересчитано формул: {report['total_formulas']}, ошибок: 0")
@@ -525,7 +561,8 @@ def main():
         if "**" in rest:  # пункт-перечисление из нескольких идей
             name, comment = "Ещё несколько идей", strip_md(bullet)[0]
         elif rest.startswith(":"):
-            comment = strip_md(rest[1:])[0]
+            comment = strip_md(rest[1:])[0].strip()
+            comment = comment[:1].upper() + comment[1:]
         else:
             head, _, tail = rest.partition(". ")
             sep = " " if head[:1].isspace() else ""
@@ -544,6 +581,8 @@ def main():
 
     wb.calculation = CalcProperties(fullCalcOnLoad=True)
     wb.properties.title = "Онлайн-сервисы для России — 34 идеи (октябрь 2026)"
+    wb.properties.creator = "Анализ"
+    wb.properties.language = "ru-RU"
     wb.save(OUT)
     print(f"Сохранено: {OUT.relative_to(ROOT)}")
     recalc = [a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--recalc=")]
