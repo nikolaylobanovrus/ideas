@@ -25,6 +25,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.workbook.properties import CalcProperties
 from openpyxl.worksheet.properties import PageSetupProperties
 from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl.worksheet.pagebreak import Break
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data" / "ideas.json"
@@ -260,6 +261,7 @@ def build_weights(wb, meta, readme):
     share.add("B16:B19")
     share.add("B23:B25")
 
+    ws.row_breaks.append(Break(id=27))  # «Формула балла» не отрывается от своего текста при печати
     ws["A28"] = "Формула балла"
     ws["A28"].font = F_BOLD
     ws["A29"] = ("Балл = ОКРУГЛ(100 × (Вес прибыльности × Прибыльность/5 + Вес популярности × Популярность/5 "
@@ -273,6 +275,7 @@ def build_weights(wb, meta, readme):
     ws["A31"] = "Шкалы оценок"
     ws["A31"].font = F_BOLD
     header_row(ws, 32, ["Шкала", "Значения"])
+    ws.merge_cells("B32:D32")
     scale_names = {"complexity": "Сложность (1–5)", "cost_tier": "Стоимость MVP (уровень 1–4)",
                    "profit": "Прибыльность (1–5)", "popularity": "Популярность (1–5)",
                    "competition": "Конкуренция в РФ", "reg_risk": "Регуляторный риск"}
@@ -303,10 +306,11 @@ def build_summary(wb, ideas):
     ws.title = "Сводная"
     ws["A1"] = "Онлайн-сервисы для России: 34 идеи, которые можно сделать с Claude Code (срез на 20.10.2026)"
     ws["A1"].font = F_TITLE
-    ws["A2"] = ("Синие ячейки и цветные столбцы «Тип», «Конкуренция в РФ», «Регуляторный риск» — экспертные оценки, их можно менять "
-                "(в цветных столбцах — выпадающие списки). Балл, место и стоимость в рублях считаются формулами; веса — на листе "
-                "«Веса и шкалы». Подробное описание каждой идеи — на листе «Карточки».")
-    ws["A2"].font = F_NOTE
+    ws["A2"] = ("Синие ячейки и цветные столбцы «Тип», «Конкуренция в РФ», «Регуляторный риск» — экспертные оценки, "
+                "их можно менять (в цветных столбцах — выпадающие списки).")
+    ws["A3"] = ("Балл, место и стоимость в рублях считаются формулами; веса — на листе «Веса и шкалы». "
+                "Подробное описание каждой идеи — на листе «Карточки».")
+    ws["A2"].font = ws["A3"].font = F_NOTE
 
     headers = ["Место", "ID", "Продукт", "Тип", "Балл\n(0–100)", "Категория", "Аналог в мире",
                "Сложность (1–5)", "Стоимость MVP, уровень (1–4)", "Стоимость MVP", "Срок MVP",
@@ -401,10 +405,11 @@ def build_summary(wb, ideas):
     ws.auto_filter.ref = f"A4:Q{last}"
     ws.page_setup.paperSize = ws.PAPERSIZE_A4
     ws.page_setup.orientation = "landscape"
-    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToWidth = 2
     ws.page_setup.fitToHeight = 0
     ws.sheet_properties.pageSetUpPr.fitToPage = True
     ws.print_title_rows = "4:4"
+    ws.print_title_cols = "A:C"
     return first, last
 
 
@@ -419,8 +424,7 @@ def build_cards(wb, ideas, cards, first, last):
         fields = cards[i["id"]]
         body_cell(ws, r, 1, i["id"], F_BOLD, CENTER_TOP)
         body_cell(ws, r, 2, i["name"], F_BOLD)
-        body_cell(ws, r, 3, TYPE_LABEL[i["type"]])
-        for col, src in ((4, "A"), (5, "E")):
+        for col, src in ((3, "D"), (4, "A"), (5, "E")):
             body_cell(ws, r, col, f"=INDEX({s}${src}${first}:${src}${last},MATCH(A{r},{s}$B${first}:$B${last},0))",
                       F_LINK_SHEET, CENTER_TOP)
         body_cell(ws, r, 6, i["analog"])
@@ -484,6 +488,22 @@ def dedupe_print_titles(xml):
     return re.sub(r'<definedName[^>]*name="_xlnm\.Print_Titles"[^>]*>.*?</definedName>', keep_first, xml)
 
 
+def place_notes(vml):
+    """LibreOffice ставит все примечания в одну точку — переносим каждое рядом со своей ячейкой."""
+    def fix(shape):
+        block = shape.group(0)
+        col = re.search(r"<x:Column>(\d+)</x:Column>", block)
+        anchor = re.search(r"<x:Anchor>(.*?)</x:Anchor>", block, re.S)
+        if not col or not anchor:
+            return block
+        a = [v.strip() for v in anchor.group(1).split(",")]
+        c = int(col.group(1))
+        a[0], a[1], a[4], a[5] = str(c + 1), "15", str(c + 3), "15"
+        return block.replace(anchor.group(0), "<x:Anchor>" + ", ".join(a) + "</x:Anchor>")
+
+    return re.sub(r"<v:shape\b.*?</v:shape>", fix, vml, flags=re.S)
+
+
 def recalc_and_fix(recalc_script):
     """Пересчитывает формулы в LibreOffice и возвращает автора комментариев, которого LibreOffice заменяет."""
     import subprocess
@@ -499,6 +519,8 @@ def recalc_and_fix(recalc_script):
                 payload = src.read(item.filename)
                 if item.filename.startswith("xl/comments"):
                     payload = payload.replace(b"Unknown Author", "Анализ".encode("utf-8"))
+                elif item.filename.startswith("xl/drawings/vmlDrawing"):
+                    payload = place_notes(payload.decode("utf-8")).encode("utf-8")
                 elif item.filename == "xl/workbook.xml":
                     payload = dedupe_print_titles(payload.decode("utf-8")).encode("utf-8")
                 dst.writestr(item, payload)
